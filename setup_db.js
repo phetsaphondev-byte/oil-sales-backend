@@ -301,6 +301,36 @@ async function runMigrations() {
       console.log('✓ price_per_liter column already exists in branch_stock table.');
     }
 
+    // 5.6 Add debt_amount to members if not exists
+    const [debtAmountColumns] = await db.query(`
+      SELECT COLUMN_NAME 
+      FROM INFORMATION_SCHEMA.COLUMNS 
+      WHERE TABLE_NAME = 'members' AND COLUMN_NAME = 'debt_amount' AND TABLE_SCHEMA = DATABASE()
+    `);
+    if (debtAmountColumns.length === 0) {
+      await db.query(`
+        ALTER TABLE members ADD COLUMN debt_amount DECIMAL(18, 2) DEFAULT 0.00;
+      `);
+      console.log('✓ Added debt_amount column to members table.');
+    } else {
+      console.log('✓ debt_amount column already exists in members table.');
+    }
+
+    // 5.7 Add remaining_debt to sales_transactions if not exists
+    const [remainingDebtColumns] = await db.query(`
+      SELECT COLUMN_NAME 
+      FROM INFORMATION_SCHEMA.COLUMNS 
+      WHERE TABLE_NAME = 'sales_transactions' AND COLUMN_NAME = 'remaining_debt' AND TABLE_SCHEMA = DATABASE()
+    `);
+    if (remainingDebtColumns.length === 0) {
+      await db.query(`
+        ALTER TABLE sales_transactions ADD COLUMN remaining_debt DECIMAL(18, 2) NULL;
+      `);
+      console.log('✓ Added remaining_debt column to sales_transactions table.');
+    } else {
+      console.log('✓ remaining_debt column already exists in sales_transactions table.');
+    }
+
     // 6. Ensure branches exist
     const [existingBranches] = await db.query(`SELECT * FROM branches`);
     let mainBranchId;
