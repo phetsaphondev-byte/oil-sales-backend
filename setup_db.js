@@ -22,7 +22,7 @@ async function runMigrations() {
       CREATE TABLE IF NOT EXISTS fuel_types (
         id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
-        price_per_liter DECIMAL(10, 2) NOT NULL,
+        price_per_liter DECIMAL(18, 2) NOT NULL,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
@@ -63,7 +63,8 @@ async function runMigrations() {
         id INT AUTO_INCREMENT PRIMARY KEY,
         branch_id INT NOT NULL,
         fuel_type_id INT NOT NULL,
-        quantity_liters DECIMAL(10, 2) DEFAULT 0.00,
+        quantity_liters DECIMAL(18, 2) DEFAULT 0.00,
+        price_per_liter DECIMAL(18, 2) NOT NULL DEFAULT 0.00,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE,
         FOREIGN KEY (fuel_type_id) REFERENCES fuel_types(id) ON DELETE CASCADE
@@ -79,6 +80,7 @@ async function runMigrations() {
         fullname VARCHAR(255) NOT NULL,
         phone VARCHAR(50),
         points INT DEFAULT 0,
+        debt_amount DECIMAL(18, 2) DEFAULT 0.00,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -135,19 +137,36 @@ async function runMigrations() {
     `);
     console.log('✓ vehicles table checked/created.');
 
+    // 3.2.1 Create fuel_imports table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS fuel_imports (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        branch_id INT NOT NULL,
+        fuel_type_id INT NOT NULL,
+        quantity_liters DECIMAL(15, 2) NOT NULL,
+        purchase_price_per_liter DECIMAL(18, 2) NOT NULL,
+        total_cost DECIMAL(18, 2) NOT NULL,
+        import_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE CASCADE,
+        FOREIGN KEY (fuel_type_id) REFERENCES fuel_types(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    console.log('✓ fuel_imports table checked/created.');
+
     // 3.3 Create sales_transactions table if not exists
     await db.query(`
       CREATE TABLE IF NOT EXISTS sales_transactions (
         id INT AUTO_INCREMENT PRIMARY KEY,
         fuel_type_id INT NOT NULL,
-        liters_sold DECIMAL(10, 2) NOT NULL,
-        total_price DECIMAL(10, 2) NOT NULL,
-        price_per_liter DECIMAL(10, 2) NULL,
+        liters_sold DECIMAL(18, 2) NOT NULL,
+        total_price DECIMAL(18, 2) NOT NULL,
+        price_per_liter DECIMAL(18, 2) NULL,
         user_id INT NULL,
         branch_id INT NULL,
         vehicle_info VARCHAR(255) NULL,
         payment_method VARCHAR(50) DEFAULT 'cash',
         debtor_name VARCHAR(255) NULL,
+        remaining_debt DECIMAL(18, 2) NULL,
         sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (fuel_type_id) REFERENCES fuel_types(id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
@@ -260,6 +279,28 @@ async function runMigrations() {
       console.log('✓ price_per_liter column already exists in sales_transactions table.');
     }
 
+    // 5.5 Add price_per_liter to branch_stock if not exists
+    const [branchStockPriceColumns] = await db.query(`
+      SELECT COLUMN_NAME 
+      FROM INFORMATION_SCHEMA.COLUMNS 
+      WHERE TABLE_NAME = 'branch_stock' AND COLUMN_NAME = 'price_per_liter' AND TABLE_SCHEMA = DATABASE()
+    `);
+    if (branchStockPriceColumns.length === 0) {
+      await db.query(`
+        ALTER TABLE branch_stock ADD COLUMN price_per_liter DECIMAL(10, 2) NOT NULL DEFAULT 0.00;
+      `);
+      console.log('✓ Added price_per_liter column to branch_stock table.');
+      // Backfill any existing records
+      await db.query(`
+        UPDATE branch_stock bs 
+        JOIN fuel_types ft ON bs.fuel_type_id = ft.id 
+        SET bs.price_per_liter = ft.price_per_liter
+      `);
+      console.log('✓ Backfilled price_per_liter for existing branch stock records.');
+    } else {
+      console.log('✓ price_per_liter column already exists in branch_stock table.');
+    }
+
     // 6. Ensure branches exist
     const [existingBranches] = await db.query(`SELECT * FROM branches`);
     let mainBranchId;
@@ -307,9 +348,9 @@ async function runMigrations() {
         if (existingStock.length === 0) {
           await db.query(`
             INSERT INTO branch_stock (branch_id, fuel_type_id, quantity_liters)
-            VALUES (?, ?, 5000.00)
+            VALUES (?, ?, 0.00)
           `, [branch.id, fuel.id]);
-          console.log(`✓ Seeded 5,000L stock for fuel type ${fuel.id} in branch ${branch.id}`);
+          console.log(`✓ Seeded 0L stock for fuel type ${fuel.id} in branch ${branch.id}`);
         }
       }
     }

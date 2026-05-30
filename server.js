@@ -53,8 +53,8 @@ const requireRole = (allowedRoles) => {
 // 2. AUTHENTICATION & USERS APIs
 // ==========================================
 
-// 2.1 API: ລົງທະບຽນຜູ້ໃຊ້ໃໝ່ (Register)
-app.post('/api/register', async (req, res) => {
+// 2.1 API: ລົງທະບຽນຜູ້ໃຊ້ໃໝ່ (Register) - Restricted to super_admin only
+app.post('/api/register', authenticateToken, requireRole(['super_admin']), async (req, res) => {
     const { username, password, fullname, role, branch_id } = req.body;
 
     // ກວດສອບຂໍ້ມູນເບື້ອງຕົ້ນ
@@ -204,7 +204,7 @@ app.get('/api/stock', authenticateToken, async (req, res) => {
         }
 
         const sql = `
-            SELECT bs.id, bs.branch_id, b.name AS branch_name, bs.fuel_type_id, ft.name AS fuel_name, ft.price_per_liter, bs.quantity_liters, bs.updated_at
+            SELECT bs.id, bs.branch_id, b.name AS branch_name, bs.fuel_type_id, ft.name AS fuel_name, bs.price_per_liter, bs.quantity_liters, bs.updated_at
             FROM branch_stock bs
             JOIN branches b ON bs.branch_id = b.id
             JOIN fuel_types ft ON bs.fuel_type_id = ft.id
@@ -219,7 +219,7 @@ app.get('/api/stock', authenticateToken, async (req, res) => {
 
 // 4.2 API: ປັບປຸງ/ເພີ່ມສະຕອກນ້ຳມັນໃນສາຂາ (ສຳລັບ ເຈົ້າຂອງສາຂາ, ຜູ້ດູແລລະບົບ ຫຼື Super Admin)
 app.post('/api/stock/adjust', authenticateToken, requireRole(['super_admin', 'branch_owner', 'admin']), async (req, res) => {
-    const { fuel_type_id, quantity_liters, branch_id } = req.body;
+    const { fuel_type_id, quantity_liters, branch_id, purchase_price_per_liter, import_date } = req.body;
     
     let targetBranchId = req.user.branch_id;
     if (req.user.role === 'super_admin' && branch_id) {
@@ -252,7 +252,57 @@ app.post('/api/stock/adjust', authenticateToken, requireRole(['super_admin', 'br
             );
         }
 
+        // --- ບັນທຶກປະຫວັດການນຳເຂົ້ານ້ຳມັນ (ຫາກເປັນການເພີ່ມສະຕອກ > 0) ---
+        if (parseFloat(quantity_liters) > 0) {
+            let finalPurchasePrice = purchase_price_per_liter;
+            if (finalPurchasePrice === undefined || finalPurchasePrice === null) {
+                // ດຶງລາຄາກາງເປັນຄ່າເລີ່ມຕົ້ນຫາກບໍ່ໄດ້ສົ່ງມາ
+                const [fuelType] = await db.query('SELECT price_per_liter FROM fuel_types WHERE id = ?', [fuel_type_id]);
+                finalPurchasePrice = fuelType.length > 0 ? fuelType[0].price_per_liter : 0;
+            }
+            const totalCost = parseFloat(quantity_liters) * parseFloat(finalPurchasePrice);
+            if (import_date) {
+                await db.query(
+                    'INSERT INTO fuel_imports (branch_id, fuel_type_id, quantity_liters, purchase_price_per_liter, total_cost, import_date) VALUES (?, ?, ?, ?, ?, ?)',
+                    [targetBranchId, fuel_type_id, quantity_liters, finalPurchasePrice, totalCost, import_date]
+                );
+            } else {
+                await db.query(
+                    'INSERT INTO fuel_imports (branch_id, fuel_type_id, quantity_liters, purchase_price_per_liter, total_cost) VALUES (?, ?, ?, ?, ?)',
+                    [targetBranchId, fuel_type_id, quantity_liters, finalPurchasePrice, totalCost]
+                );
+            }
+        }
+
         res.json({ success: true, message: 'ປັບປຸງສະຕອກສິນຄ້າສຳເລັດແລ້ວ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 4.3 API: ເບິ່ງປະຫວັດການນຳເຂົ້ານ້ຳມັນ (Fuel Imports History)
+app.get('/api/stock/imports', authenticateToken, async (req, res) => {
+    try {
+        let targetBranchId = req.user.branch_id;
+        if (req.user.role === 'super_admin' && req.query.branch_id) {
+            targetBranchId = parseInt(req.query.branch_id);
+        }
+
+        if (!targetBranchId) {
+            return res.status(400).json({ success: false, message: 'ກະລຸນາລະບຸ ID ສາຂາ' });
+        }
+
+        const sql = `
+            SELECT fi.id, fi.branch_id, b.name AS branch_name, fi.fuel_type_id, ft.name AS fuel_name, 
+                   fi.quantity_liters, fi.purchase_price_per_liter, fi.total_cost, fi.import_date
+            FROM fuel_imports fi
+            JOIN branches b ON fi.branch_id = b.id
+            JOIN fuel_types ft ON fi.fuel_type_id = ft.id
+            WHERE fi.branch_id = ?
+            ORDER BY fi.import_date DESC
+        `;
+        const [rows] = await db.query(sql, [targetBranchId]);
+        res.json({ success: true, data: rows });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -304,6 +354,158 @@ app.get('/api/members', authenticateToken, async (req, res) => {
 
         const [rows] = await db.query(sql, params);
         res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 5.3 API: ຊຳລະໜີ້/ຈ່າຍໜີ້ (Pay/Settle Debt)
+app.post('/api/members/pay-debt', authenticateToken, async (req, res) => {
+    const { member_id, amount, transaction_id } = req.body;
+    const branch_id = req.user.branch_id;
+
+    console.log('[PAY-DEBT] Received:', { member_id, amount, transaction_id, branch_id });
+
+    if (!member_id || amount === undefined || amount <= 0) {
+        return res.status(400).json({ success: false, message: 'ກະລຸນາປ້ອນຂໍ້ມູນໃຫ້ຄົບຖ້ວນ' });
+    }
+
+    try {
+        const [memberRows] = await db.query(
+            'SELECT debt_amount, fullname FROM members WHERE id = ? AND branch_id = ?',
+            [member_id, branch_id]
+        );
+
+        console.log('[PAY-DEBT] Member found:', memberRows.length > 0 ? memberRows[0] : 'NOT FOUND');
+
+        if (memberRows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ບໍ່ພົບຂໍ້ມູນຜູ້ຕິດໜີ້' });
+        }
+
+        const currentDebt = parseFloat(memberRows[0].debt_amount);
+        const payAmount = parseFloat(amount);
+        
+        console.log('[PAY-DEBT] currentDebt:', currentDebt, 'payAmount:', payAmount, 'check:', payAmount > currentDebt);
+
+        if (payAmount > currentDebt) {
+            return res.status(400).json({ success: false, message: 'ຈຳນວນເງິນທີ່ຊຳລະຫຼາຍກວ່າໜີ້ສິນຄົງເຫຼືອ' });
+        }
+
+        const newDebt = currentDebt - payAmount;
+        
+        await db.query(
+            'UPDATE members SET debt_amount = ? WHERE id = ?',
+            [newDebt, member_id]
+        );
+
+        if (transaction_id) {
+            console.log('[PAY-DEBT] Specific transaction mode, id:', transaction_id, 'branch_id:', branch_id);
+            // Apply payment directly to the specified transaction
+            const [txRows] = await db.query(
+                'SELECT remaining_debt FROM sales_transactions WHERE id = ? AND branch_id = ?',
+                [transaction_id, branch_id]
+            );
+            console.log('[PAY-DEBT] txRows found:', txRows.length, txRows[0]);
+
+            if (txRows.length > 0) {
+                const currentTxDebt = parseFloat(txRows[0].remaining_debt);
+                const newTxDebt = Math.max(0.00, currentTxDebt - payAmount);
+                await db.query(
+                    'UPDATE sales_transactions SET remaining_debt = ? WHERE id = ?',
+                    [newTxDebt, transaction_id]
+                );
+            }
+        } else {
+            // Apply payment in FIFO order to individual transactions' remaining_debt
+            const [transactions] = await db.query(
+                `SELECT id, remaining_debt FROM sales_transactions 
+                 WHERE branch_id = ? AND debtor_name = ? AND payment_method = 'debt' AND remaining_debt > 0 
+                 ORDER BY sale_date ASC`,
+                [branch_id, memberRows[0].fullname]
+            );
+
+            let remainingPayment = payAmount;
+            for (const tx of transactions) {
+                if (remainingPayment <= 0) break;
+                const currentTxDebt = parseFloat(tx.remaining_debt);
+                if (remainingPayment >= currentTxDebt) {
+                    await db.query('UPDATE sales_transactions SET remaining_debt = 0 WHERE id = ?', [tx.id]);
+                    remainingPayment -= currentTxDebt;
+                } else {
+                    const newTxDebt = currentTxDebt - remainingPayment;
+                    await db.query('UPDATE sales_transactions SET remaining_debt = ? WHERE id = ?', [newTxDebt, tx.id]);
+                    remainingPayment = 0;
+                }
+            }
+        }
+
+        // ບັນທຶກການຊຳລະໜີ້ເປັນທຸລະກຳຕິດລົບ
+        await db.query(
+            'INSERT INTO sales_transactions (fuel_type_id, liters_sold, total_price, price_per_liter, user_id, branch_id, payment_method, debtor_name) VALUES (1, 0, ?, 0, ?, ?, ?, ?)',
+            [-payAmount, req.user.id, branch_id, 'cash', memberRows[0].fullname]
+        );
+
+        res.json({ success: true, message: 'ຊຳລະໜີ້ສິນສຳເລັດແລ້ວ', new_debt: newDebt });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 5.4 API: ປະຫວັດການຕິດໜີ້ລາຍບຸກຄົນ (Debt details by member)
+app.get('/api/members/debt-details', authenticateToken, async (req, res) => {
+    const { debtor_name } = req.query;
+    const branch_id = req.user.branch_id;
+
+    if (!debtor_name) {
+        return res.status(400).json({ success: false, message: 'ກະລຸນາລະບຸຊື່ຜູ້ຕິດໜີ້' });
+    }
+
+    try {
+        const sql = `
+            SELECT st.id, ft.name AS fuel_name, st.liters_sold, st.total_price, 
+                   st.price_per_liter, st.sale_date, st.payment_method, st.remaining_debt
+            FROM sales_transactions st
+            LEFT JOIN fuel_types ft ON st.fuel_type_id = ft.id
+            WHERE st.branch_id = ? AND st.debtor_name = ? AND st.payment_method = 'debt'
+            ORDER BY st.sale_date DESC
+        `;
+        const [rows] = await db.query(sql, [branch_id, debtor_name]);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 5.5 API: ປະຫວັດການຊຳລະໜີ້ທັງໝົດຂອງສາຂາ (All repayment history for the branch)
+app.get('/api/members/repayment-history', authenticateToken, async (req, res) => {
+    const branch_id = req.user.branch_id;
+    try {
+        const sql = `
+            SELECT st.id, st.debtor_name, st.total_price, st.sale_date, u.fullname AS seller
+            FROM sales_transactions st
+            LEFT JOIN users u ON st.user_id = u.id
+            WHERE st.branch_id = ? AND st.total_price < 0 AND st.liters_sold = 0 AND st.debtor_name IS NOT NULL
+            ORDER BY st.sale_date DESC
+        `;
+        const [rows] = await db.query(sql, [branch_id]);
+        
+        // For each repayment, let's find the current remaining debt of that member
+        const [members] = await db.query('SELECT fullname, debt_amount FROM members WHERE branch_id = ?', [branch_id]);
+        const memberDebtMap = {};
+        members.forEach(m => {
+            memberDebtMap[m.fullname] = m.debt_amount;
+        });
+
+        const data = rows.map(r => ({
+            id: r.id,
+            debtor_name: r.debtor_name,
+            amount_paid: Math.abs(parseFloat(r.total_price)),
+            sale_date: r.sale_date,
+            seller: r.seller,
+            remaining_debt: memberDebtMap[r.debtor_name] !== undefined ? parseFloat(memberDebtMap[r.debtor_name]) : 0.0
+        }));
+
+        res.json({ success: true, data });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -370,6 +572,34 @@ app.get('/api/vehicles', authenticateToken, async (req, res) => {
     }
 });
 
+// 5.1.3 API: ດຶງປະຫວັດການເຕີມນ້ຳມັນຂອງລົດແຕ່ລະຄັນ (Pumping history by vehicle)
+app.get('/api/vehicles/history', authenticateToken, async (req, res) => {
+    const { plate_number } = req.query;
+    let targetBranchId = req.user.branch_id;
+    console.log('[VEHICLE-HISTORY] Request for plate:', plate_number, 'branch:', targetBranchId);
+
+    if (!plate_number) {
+        return res.status(400).json({ success: false, message: 'ກະລຸນາລະບຸທະບຽນລົດ' });
+    }
+
+    try {
+        const sql = `
+            SELECT st.id, ft.name AS fuel_name, st.liters_sold, st.total_price, 
+                   st.price_per_liter, st.sale_date, st.payment_method, st.debtor_name, u.fullname AS seller
+            FROM sales_transactions st
+            LEFT JOIN fuel_types ft ON st.fuel_type_id = ft.id
+            LEFT JOIN users u ON st.user_id = u.id
+            WHERE st.branch_id = ? AND st.vehicle_info = ?
+            ORDER BY st.sale_date DESC
+        `;
+        const [rows] = await db.query(sql, [targetBranchId, plate_number.trim()]);
+        res.json({ success: true, data: rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+
 // ==========================================
 // 6. FUEL TYPES APIs (Global list)
 // ==========================================
@@ -386,9 +616,14 @@ app.get('/api/fuel', async (req, res) => {
 
 // 6.2 API: ປັບປຸງລາຄານ້ຳມັນ (ສຳລັບ ເຈົ້າຂອງສາຂາ, ຜູ້ດູແລລະບົບ ຫຼື Super Admin)
 app.post('/api/fuel/update-price', authenticateToken, requireRole(['super_admin', 'branch_owner', 'admin']), async (req, res) => {
-    const { fuel_type_id, price_per_liter } = req.body;
+    const { fuel_type_id, price_per_liter, branch_id } = req.body;
     
-    if (!fuel_type_id || !price_per_liter) {
+    let targetBranchId = req.user.branch_id;
+    if (req.user.role === 'super_admin' && branch_id) {
+        targetBranchId = parseInt(branch_id);
+    }
+
+    if (!targetBranchId || !fuel_type_id || !price_per_liter) {
         return res.status(400).json({ success: false, message: 'ກະລຸນາປ້ອນຂໍ້ມູນໃຫ້ຄົບຖ້ວນ' });
     }
 
@@ -398,7 +633,24 @@ app.post('/api/fuel/update-price', authenticateToken, requireRole(['super_admin'
             return res.status(400).json({ success: false, message: 'ກະລຸນາປ້ອນລາຄາທີ່ຖືກຕ້ອງ' });
         }
 
-        await db.query('UPDATE fuel_types SET price_per_liter = ? WHERE id = ?', [newPrice, fuel_type_id]);
+        // ກວດສອບວ່າມີແຖວສະຕອກນີ້ໃນສາຂາແລ້ວຫຼືບໍ່
+        const [existing] = await db.query(
+            'SELECT id FROM branch_stock WHERE branch_id = ? AND fuel_type_id = ?',
+            [targetBranchId, fuel_type_id]
+        );
+
+        if (existing.length > 0) {
+            await db.query(
+                'UPDATE branch_stock SET price_per_liter = ? WHERE id = ?',
+                [newPrice, existing[0].id]
+            );
+        } else {
+            await db.query(
+                'INSERT INTO branch_stock (branch_id, fuel_type_id, quantity_liters, price_per_liter) VALUES (?, ?, 0.00, ?)',
+                [targetBranchId, fuel_type_id, newPrice]
+            );
+        }
+
         res.json({ success: true, message: 'ປັບປຸງລາຄານ້ຳມັນສຳເລັດແລ້ວ' });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -409,8 +661,9 @@ app.post('/api/fuel/update-price', authenticateToken, requireRole(['super_admin'
 // 7. SALES RECORDING & REPORTING APIs (With Isolation and Auto Stock Deduction)
 // ==========================================
 
-// 7.1 API: ບັນທຶກການຂາຍນ້ຳມັນໃໝ່ (ແຍກສາຂາ + ຕັດສະຕອກອັດຕະໂນມັດ)
+// 7.1 API: ບັນທຶກການຂາຍນ້ຳມັນໃໝ່ (ແຍກສາຂา + ຕັດສະຕອກອັດຕະໂນມັດ)
 app.post('/api/sales', authenticateToken, async (req, res) => {
+    console.log('[API-SALE] Received body:', req.body);
     const { fuel_type_id, liters_sold, total_price, vehicle_info, payment_method, debtor_name } = req.body;
     const user_id = req.user.id;
     const branch_id = req.user.branch_id;
@@ -428,7 +681,7 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     try {
         // --- ຂັ້ນຕອນທີ 1: ກວດສອບ ແລະ ຕັດສະຕອກໃນສາຂາ ---
         const [stockRows] = await db.query(
-            `SELECT bs.id, bs.quantity_liters, ft.price_per_liter 
+            `SELECT bs.id, bs.quantity_liters, COALESCE(NULLIF(bs.price_per_liter, 0), ft.price_per_liter) AS price_per_liter 
              FROM branch_stock bs 
              JOIN fuel_types ft ON bs.fuel_type_id = ft.id 
              WHERE bs.branch_id = ? AND bs.fuel_type_id = ?`,
@@ -458,8 +711,8 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         );
 
         // --- ຂັ້ນຕອນທີ 3: ບັນທຶກທຸລະກຳການຂາຍ (ພ້ອມບັນທຶກລາຄາຕໍ່ລິດໃນຂະນະນັ້ນ) ---
-        const sql = `INSERT INTO sales_transactions (fuel_type_id, liters_sold, total_price, price_per_liter, user_id, branch_id, vehicle_info, payment_method, debtor_name) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        const sql = `INSERT INTO sales_transactions (fuel_type_id, liters_sold, total_price, price_per_liter, user_id, branch_id, vehicle_info, payment_method, debtor_name, remaining_debt) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
         const [result] = await db.query(sql, [
             fuel_type_id, 
             liters_sold, 
@@ -469,8 +722,17 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
             branch_id, 
             vehicle_info || null, 
             final_payment_method, 
-            final_payment_method === 'debt' ? debtor_name : null
+            final_payment_method === 'debt' ? debtor_name : null,
+            final_payment_method === 'debt' ? total_price : null
         ]);
+
+        // ປັບປຸງຍອດໜີ້ໃນຕາຕະລາງ members ຫາກເປັນການຕິດໜີ້
+        if (final_payment_method === 'debt' && debtor_name) {
+            await db.query(
+                'UPDATE members SET debt_amount = debt_amount + ? WHERE fullname = ? AND branch_id = ?',
+                [total_price, debtor_name, branch_id]
+            );
+        }
         
         res.status(201).json({ 
             success: true, 
