@@ -744,9 +744,11 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     }
 });
 
-// 7.2 API: ເບິ່ງລາຍງານການຂາຍ (Isolated ຕາມບົດບາດ ແລະ ສາຂາ)
+// 7.2 API: ເບິ່ງລາຍງານການຂາຍ (Isolated ຕາມບົດບາດ ແລະ ສາຂາ + Filter ວັນທີ)
 app.get('/api/sales-report', authenticateToken, async (req, res) => {
     try {
+        const { start_date, end_date } = req.query;
+
         let sql = `
             SELECT st.id, b.name AS branch_name, ft.name AS fuel_name, st.liters_sold, st.total_price, 
                    COALESCE(st.price_per_liter, ft.price_per_liter) AS price_per_liter,
@@ -755,17 +757,28 @@ app.get('/api/sales-report', authenticateToken, async (req, res) => {
             JOIN fuel_types ft ON st.fuel_type_id = ft.id
             JOIN users u ON st.user_id = u.id
             LEFT JOIN branches b ON st.branch_id = b.id
+            WHERE 1=1
         `;
         let params = [];
 
         // ຖ້າບໍ່ແມ່ນ Super Admin ຈະເຫັນສະເພາະປະຫວັດຂອງສາຂາຕົນເອງ
         if (req.user.role !== 'super_admin') {
-            sql += ' WHERE st.branch_id = ?';
-            params = [req.user.branch_id];
+            sql += ' AND st.branch_id = ?';
+            params.push(req.user.branch_id);
         } else if (req.query.branch_id) {
             // Super Admin ຕ້ອງການກັ່ນຕອງຕາມສາຂາ
-            sql += ' WHERE st.branch_id = ?';
-            params = [parseInt(req.query.branch_id)];
+            sql += ' AND st.branch_id = ?';
+            params.push(parseInt(req.query.branch_id));
+        }
+
+        // ກັ່ນຕອງຕາມວັນທີ (start_date & end_date) ຖ້າມີ
+        if (start_date) {
+            sql += ' AND DATE(st.sale_date) >= DATE(?)';
+            params.push(start_date);
+        }
+        if (end_date) {
+            sql += ' AND DATE(st.sale_date) <= DATE(?)';
+            params.push(end_date);
         }
 
         sql += ' ORDER BY st.sale_date DESC';
